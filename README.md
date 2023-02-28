@@ -3,6 +3,6 @@ This is a general relation extraction (RE) toolkit for BERT model training, eval
 
 Framework: **PyTorch**, **Transformers**
 
-Competable annotation tools: **Label-studio**, **BRAT**
+Compatible annotation tools: **Label-studio**, **BRAT**
 
 ![alt text](https://github.com/daviden1013/NLP_RE_Pipelines/blob/main/Diagrams.png)
