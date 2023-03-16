@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-PATH = r'E:\David projects\ADE medication RE'
-
+import abc
 from typing import List, Dict, Tuple
 import os
 import re
 import numpy as np
 import pandas as pd
+import json
 from itertools import combinations
 from transformers import AutoTokenizer
 import torch
@@ -17,10 +17,52 @@ from tqdm import tqdm
 
 
 class Annotation_loader:
-  def __init__(self, max_dist:int, ann_dir:str, constrains:List[Tuple[str, str]]=None):
-    self.ann_dir = ann_dir
+  def __init__(self, max_dist:int, constrains:List[Tuple[str, str]]=None):
+    """
+    This class inputs annotation and constrains, outputs a pd.DataFrame of eneity-pairs
+    to train model for relation extraction.
+
+    Parameters
+    ----------
+    max_dist : int
+      Maximum char distance to consider relations. Any entity pairs with > max_dist 
+      will be assumed no relation, thus NOT included in output.
+    constrains : List[Tuple[str, str]], optional
+      List of valid entity-type pairs to model. The default is None.
+    """
     self.max_dist = max_dist
     self.constrains = constrains
+
+  def _apply_constrains(self, entity_1_type:str, entity_2_type:str) -> bool:
+    """
+    This method checks if 2 entity types need to be modeled based on constrains.
+    """
+    for t in self.constrains:
+      if (entity_1_type == t[0] and entity_2_type == t[1]) or (entity_1_type == t[1] and entity_2_type == t[0]):
+        return True
+    return False
+  
+  @abc.abstractmethod
+  def get_relations(self) -> pd.DataFrame:
+    """
+    Call _get_relations() on each annotation
+
+    Returns
+    -------
+    pd.DataFrame
+      DataFrame with document_id, entity_1 (entity ID), entity_2 (entity ID), 
+      entity_1_type, entity_1_start, entity_1_end,
+      entity_2_type, entity_2_start, entity_2_end,
+      relation_id (optional), relation_type
+    """
+    return NotImplemented
+
+
+class BRAT_annotation_loader(Annotation_loader):
+  def __init__(self, max_dist:int, ann_dir:str, constrains:List[Tuple[str, str]]=None):
+    """ This is a child annotation loader for BRAT """
+    super().__init__(max_dist, constrains)
+    self.ann_dir = ann_dir
     
   def _get_relations(self, ann:List[str]) -> pd.DataFrame:
     """
@@ -87,19 +129,17 @@ class Annotation_loader:
     for i in [1,2]:
       rel = pd.merge(rel, entity_df, left_on=f'entity_{i}', right_on='entity_id', how='left')
       rel.drop(columns=['entity_id'], inplace=True)
-      rel.rename(columns={'entity_type':f'entity_{i}_type', 'start':f'entity_{i}_start', 'end':f'entity_{i}_end'}, inplace=True)
+      rel.rename(columns={'entity_type':f'entity_{i}_type', 
+                          'start':f'entity_{i}_start', 
+                          'end':f'entity_{i}_end'}, inplace=True)
     
     rel = rel.loc[abs(rel['entity_2_start'] - rel['entity_1_start']) <= self.max_dist]
+    rel['relation_type'] = rel['relation_type'].fillna('No_relation')
     if self.constrains is not None:
       rel = rel.loc[rel.apply(lambda x:self._apply_constrains(x.entity_1_type, x.entity_2_type), axis=1)]
     
     return rel
-    
-  def _apply_constrains(self, entity_1_type:str, entity_2_type:str):
-    for t in self.constrains:
-      if (entity_1_type == t[0] and entity_2_type == t[1]) or (entity_1_type == t[1] and entity_2_type == t[0]):
-        return True
-    return False
+  
   
   def get_relations(self) -> pd.DataFrame:
     """
@@ -108,10 +148,10 @@ class Annotation_loader:
     Returns
     -------
     pd.DataFrame
-      DataFrame with document_id, entity_1, entity_2, 
+      DataFrame with document_id, entity_1 (entity ID), entity_2 (entity ID), 
       entity_1_type, entity_1_start, entity_1_end,
       entity_2_type, entity_2_start, entity_2_end,
-      relation_id, relation_type
+      relation_id (optional), relation_type
     """
     files = os.listdir(self.ann_dir)
     loop = tqdm(files, total=len(files), leave=True)
@@ -129,8 +169,122 @@ class Annotation_loader:
                                   'entity_1_type', 'entity_1_start', 'entity_1_end',
                                   'entity_2_type', 'entity_2_start', 'entity_2_end',
                                   'relation_id', 'relation_type']]
-    rel_df['relation_type'] = rel_df['relation_type'].fillna('No_relation')
+    
     return rel_df
+  
+
+class Label_studio_annotation_loader(Annotation_loader):
+  """ This is a child annotation loader for Label-studio """
+  def __init__(self, max_dist:int, ann_file:str, ID:str, constrains:List[Tuple[str, str]]=None):
+    super().__init__(max_dist, constrains)
+    self.ann_file = ann_file
+    self.ID = ID
+    
+  def _get_relations(self, ann:Dict) -> pd.DataFrame:
+    """
+    This method inputs a json of 1 document's annotation and outputs a DataFrame of 
+    entity combinations. Some combo has negative (no) relation.
+    entity_1's ID is always < entity_2's ID.
+    When entity_1's start and entity_2's start > max_dist, we do not include in output 
+    (default to no relation).
+
+    Parameters
+    ----------
+    ann : List
+      json of annotation
+    constrains : List
+      List of possible entity type combo to consider relation. If not None, it 
+      will only reture the combo in list.
+
+    Returns
+    -------
+    pd.DataFrame
+      a DataFrame with relation_id, relation_type, entity_1, entity_2, 
+      entity_1_type, entity_1_start, entity_1_end
+      entity_2_type, entity_2_start, entity_2_end
+    """
+    entity_list = []
+    rel_list = []
+    for r in ann['annotations'][0]['result']:
+      if r['type']=='labels':
+        entity_list.append({'entity_id':r['id'], 
+                            'entity_type':r['value']['labels'][0], 
+                            'start':r['value']['start'], 
+                            'end':r['value']['end']})
+      elif r['type']=='relation':
+        if r['from_id'] < r['to_id']:
+          rel_list.append({'entity_1':r['from_id'], 'entity_2':r['to_id'], 'relation_type':'Related'})
+        else:
+          rel_list.append({'entity_1':r['to_id'], 'entity_2':r['from_id'], 'relation_type':'Related'})
+                
+    if len(rel_list) == 0:
+      return None
+        
+    rel_df = pd.DataFrame(rel_list)
+    entity_df = pd.DataFrame(entity_list)
+
+    comb = [sorted(c) for c in combinations(entity_df['entity_id'], 2)]
+    comb = pd.DataFrame(comb, columns=['entity_1', 'entity_2'])
+    rel = pd.merge(comb, rel_df, on=['entity_1', 'entity_2'], how='left')
+    for i in [1,2]:
+      rel = pd.merge(rel, entity_df, left_on=f'entity_{i}', right_on='entity_id', how='left')
+      rel.drop(columns=['entity_id'], inplace=True)
+      rel.rename(columns={'entity_type':f'entity_{i}_type', 
+                          'start':f'entity_{i}_start', 
+                          'end':f'entity_{i}_end'}, inplace=True)
+    
+    rel = rel.loc[abs(rel['entity_2_start'] - rel['entity_1_start']) <= self.max_dist]
+    rel['relation_type'] = rel['relation_type'].fillna('No_relation')
+    if self.constrains is not None:
+      rel = rel.loc[rel.apply(lambda x:self._apply_constrains(x.entity_1_type, x.entity_2_type), axis=1)]
+    
+    return rel
+  
+  
+  def get_relations(self) -> pd.DataFrame:
+    """
+    Call _get_relations() on each annotation
+
+    Returns
+    -------
+    pd.DataFrame
+      DataFrame with document_id, entity_1 (entity ID), entity_2 (entity ID), 
+      entity_1_type, entity_1_start, entity_1_end,
+      entity_2_type, entity_2_start, entity_2_end,
+      relation_id (optional), relation_type
+    """
+    with open(self.ann_file, encoding='utf-8') as f:
+      annotation = json.loads(f.read())
+    loop = tqdm(annotation, total=len(annotation), leave=True)
+    rel_list = []
+    for ann in loop:
+      loop.set_description(f"Processing {ann['data'][self.ID]}")
+      rel = self._get_relations(ann)
+      if rel is not None:
+        rel['document_id'] = ann['data'][self.ID]
+        rel_list.append(rel)        
+    
+    rel_df = pd.concat(rel_list)[['document_id', 'entity_1', 'entity_2', 
+                                  'entity_1_type', 'entity_1_start', 'entity_1_end',
+                                  'entity_2_type', 'entity_2_start', 'entity_2_end',
+                                  'relation_type']]
+    
+    return rel_df
+  
+  def get_text(self) -> pd.DataFrame:
+    with open(self.ann_file, encoding='utf-8') as f:
+      annotation = json.loads(f.read())
+    loop = tqdm(annotation, total=len(annotation), leave=True)
+    text_list = []
+    for ann in loop:
+      loop.set_description(f"Processing {ann['data'][self.ID]}")
+      text = {}
+      text['document_id'] = ann['data'][self.ID]
+      text['text'] = ann['data']['text']
+      text_list.append(text)
+  
+    text_df = pd.DataFrame(text_list)
+    return text_df
   
 
 class RE_Dataset(Dataset):
@@ -149,10 +303,10 @@ class RE_Dataset(Dataset):
     Parameters
     ----------
     rel_df : pd.DataFrame
-      DataFarme with document_id, entity_1, entity_2, 
+      DataFarme with document_id, entity_1 (entity ID), entity_2 (entity ID), 
                       entity_1_type, entity_1_start, entity_1_end,
                       entity_2_type, entity_2_start, entity_2_end,
-                      relation_id, relation_type.
+                      relation_type.
       Note: this is all comination of entities. Some entity-pairs have 
       no relation (relation_type="No_relation")                     
     doc_dict : Dict[str:str]
@@ -446,3 +600,71 @@ def evaluate(df:pd.DataFrame, label_map:Dict[str, int]) -> Dict[str, Dict[str,fl
     eva[k]['Accuracy'] = accuracy_score(gold[k], df[f'{k}_pred'])
     
   return eva
+
+
+class Entity_pair_maker:
+  def __init__(self, entities:pd.DataFrame, max_dist:int, constrains:List[Tuple[str, str]]=None):
+    """
+    This class inputs a list of entities (from NER) and constrains, 
+    outputs a pd.DataFrame of eneity-pairs for relation extraction prediction.
+    Return dataframe has columns: 'document_id', 'entity_1', 'entity_2', 
+          'entity_1_type', 'entity_1_start', 'entity_1_end',
+          'entity_2_type', 'entity_2_start', 'entity_2_end'
+    entity_1 is always < entity_2 (compare str of IDs). No duplicates.
+
+    Parameters
+    ----------
+    entities : pd.DataFrame
+      Entities from NER. Must have columns: document_id, start, end, pred (entity_type)
+    max_dist : int
+      Maximum char distance to consider relations. Any entity pairs with > max_dist 
+      will be assumed no relation, thus NOT included in output.
+    constrains : List[Tuple[str, str]], optional
+      List of valid entity-type pairs to model. The default is None.
+    """
+    self.max_dist = max_dist
+    self.constrains = constrains
+    self.entities = entities
+    
+  def _apply_constrains(self, entity_1_type:str, entity_2_type:str) -> bool:
+    """
+    This method checks if 2 entity types need to be modeled based on constrains.
+    """
+    for t in self.constrains:
+      if (entity_1_type == t[0] and entity_2_type == t[1]) or (entity_1_type == t[1] and entity_2_type == t[0]):
+        return True
+    return False
+  
+    
+  def get_entity_pairs(self) -> pd.DataFrame:
+    # All cominations of entities
+    comb = pd.merge(self.entities, self.entities, on='document_id')
+    comb.rename(columns={'entity_id_x':'entity_1', 'entity_id_y':'entity_2',
+                     'pred_x':'entity_1_type', 'start_x':'entity_1_start', 'end_x':'entity_1_end',
+                     'pred_y':'entity_2_type', 'start_y':'entity_2_start', 'end_y':'entity_2_end'
+                     }, inplace=True)
+    # Drop duplicates, set entity_1 < entity_2
+    def dedup(document_id:str, entity_1:str, entity_2:str, entity_1_type:str, entity_1_start:int,
+              entity_1_end:int, entity_2_type:str, entity_2_start:int, entity_2_end:int):
+      if entity_1 < entity_2:
+        return (document_id, entity_1, entity_2, entity_1_type, entity_1_start, entity_1_end, entity_2_type,
+                entity_2_start, entity_2_end)
+      return (document_id, entity_2, entity_1, entity_2_type, entity_2_start, entity_2_end, 
+              entity_1_type, entity_1_start, entity_1_end)
+    
+    sorted_comb = comb.apply(lambda x:dedup(x.document_id, x.entity_1, x.entity_2, x.entity_1_type,
+                              x.entity_1_start, x.entity_1_end, x.entity_2_type, 
+                              x.entity_2_start, x.entity_2_end), axis=1)
+    
+    comb = pd.DataFrame(list(sorted_comb), columns=['document_id', 'entity_1', 'entity_2', 
+                                                    'entity_1_type', 'entity_1_start', 'entity_1_end',
+                                                    'entity_2_type', 'entity_2_start', 'entity_2_end'])
+    comb.drop_duplicates(inplace=True)
+    comb = comb.loc[abs(comb['entity_2_start'] - comb['entity_1_start']) <= self.max_dist]
+    
+    if self.constrains is not None:
+      comb = comb.loc[comb.apply(lambda x:self._apply_constrains(x.entity_1_type, x.entity_2_type), axis=1)]
+    
+    return comb.reset_index(drop=True)
+    
+    
