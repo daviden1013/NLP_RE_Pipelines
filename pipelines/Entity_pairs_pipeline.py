@@ -24,7 +24,7 @@ def main():
   pprint.pprint(config)
   print(datetime.now())
   """ make training datasets """
-  loader = Annotation_loader(max_dist=config['max_dist'], 
+  loader = BRAT_annotation_loader(max_dist=config['max_dist'], 
                              ann_dir=config['ann_dir'],
                              constrains=eval(config['constrains']))
   rel = loader.get_relations()
