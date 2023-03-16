@@ -25,8 +25,8 @@ def main():
   print(datetime.now())
   """ make training datasets """
   loader = BRAT_annotation_loader(max_dist=config['max_dist'], 
-                             ann_dir=config['ann_dir'],
-                             constrains=eval(config['constrains']))
+                                  ann_dir=config['ann_dir'],
+                                  constrains=eval(config['constrains']))
   rel = loader.get_relations()
   """ Save """
   if not os.path.isdir(config['entity_pairs_path']):
