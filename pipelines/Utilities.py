@@ -174,11 +174,24 @@ class BRAT_annotation_loader(Annotation_loader):
   
 
 class Label_studio_annotation_loader(Annotation_loader):
-  """ This is a child annotation loader for Label-studio """
-  def __init__(self, max_dist:int, ann_file:str, ID:str, constrains:List[Tuple[str, str]]=None):
+  """ 
+  This is a child annotation loader for Label-studio 
+  Since Label-studio doesn't allow specify relation type during annotation,
+  The rel_type (pull from config) defines it. 
+  
+  rel_type : Dict[Tuple[str], str]
+    Definition of relation types. Dictionary key is a 2-tuple of entity types. 
+    Value is relation type.
+  """
+  def __init__(self, max_dist:int, ann_file:str, ID:str, rel_type:Dict[Tuple[str], str], 
+               constrains:List[Tuple[str, str]]=None):
     super().__init__(max_dist, constrains)
     self.ann_file = ann_file
     self.ID = ID
+    self.rel_type = {}
+    for (e1, e2), rel in rel_type.items():
+      self.rel_type[(e1, e2)] = rel
+      self.rel_type[(e2, e1)] = rel
     
   def _get_relations(self, ann:Dict) -> pd.DataFrame:
     """
@@ -233,10 +246,20 @@ class Label_studio_annotation_loader(Annotation_loader):
                           'start':f'entity_{i}_start', 
                           'end':f'entity_{i}_end'}, inplace=True)
     
+    # Filter by max_dist
     rel = rel.loc[abs(rel['entity_2_start'] - rel['entity_1_start']) <= self.max_dist]
-    rel['relation_type'] = rel['relation_type'].fillna('No_relation')
+    
+    # Filter by constrains
     if self.constrains is not None:
       rel = rel.loc[rel.apply(lambda x:self._apply_constrains(x.entity_1_type, x.entity_2_type), axis=1)]
+    
+    # Assign relation types
+    def assign_relation(e1:str, e2:str, r:str) -> str:
+      if r == 'Related' and (e1, e2) in self.rel_type:
+        return self.rel_type[(e1, e2)]
+      return 'No_relation'
+      
+    rel['relation_type'] = rel.apply(lambda x:assign_relation(x.entity_1_type, x.entity_2_type, x.relation_type), axis=1)
     
     return rel
   
@@ -585,6 +608,7 @@ class RE_Predictor:
     dummy = pd.get_dummies(pred_df['pred'])
     dummy.columns = [c.replace('_prob', '_pred') for c in dummy.columns]
     pred_df = pd.concat([pred_df, dummy], axis=1)
+    pred_df['pred'] = pred_df['pred'].str.replace('_prob', '')
     return pred_df
   
   
